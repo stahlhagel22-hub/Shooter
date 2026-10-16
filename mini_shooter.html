@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mini Shooter - Adventure Plot Engine</title>
+  <style>
+    html,body{height:100%;margin:0;background:#111;color:#ddd;font-family:Arial}
+    #gameCanvas{display:block;background:#6b8a9a;cursor:none}
+    #ui{position:fixed;left:10px;top:10px;color:#fff;z-index:10}
+    .hint{opacity:0.9;background:rgba(0,0,0,0.4);padding:6px;border-radius:6px;margin-bottom:6px}
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <div id="ui">
+    <div class="hint" id="hud"></div>
+    <div class="hint">Steuerung: WASD bewegen · Maus zielen · Linksklick schießen · C ducken</div>
+  </div>
+
+<script>
+// Mini Shooter
+// - Spieler hat Fadenkreuz (Maus), kann schießen (Linksklick)
+// - Feinde bewegen sich, suchen Deckungen (Polygone) und schießen zurück
+// - Ducken (Taste C) verkleinert Sichtfeld
+// Autor: Copilot
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let W = canvas.width = window.innerWidth;
+let H = canvas.height = window.innerHeight;
+window.addEventListener('resize', ()=>{W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight;});
+
+// Game configuration
+const config = {
+  playerSpeed: 180, // px/s
+  crouchSpeed: 100,
+  playerRadius: 14,
+  fovRadius: 340,
+  crouchFov: 180,
+  bulletSpeed: 900,
+  enemySpeed: 80,
+  enemySpawn: 6,
+  enemyFireInterval: 1.4,
+  enemyHealth: 3,
+  playerHealth: 10
+};
+
+// Polygons that act as cover (list of arrays of {x,y})
+const covers = [];
+
+function addRectCover(x,y,w,h,angle=0){
+  // add rectangle polygon centered at x,y
+  const hw=w/2, hh=h/2;
+  const pts = [
+    {x:-hw,y:-hh},{x:hw,y:-hh},{x:hw,y:hh},{x:-hw,y:hh}
+  ].map(p=>{
+    const rx = p.x*Math.cos(angle)-p.y*Math.sin(angle)+x;
+    const ry = p.x*Math.sin(angle)+p.y*Math.cos(angle)+y;
+    return {x:rx,y:ry};
+  });
+  covers.push(pts);
+}
+
+// Add some covers (tables, cars, walls)
+function initCovers(){
+  covers.length = 0;
+  addRectCover(W*0.35,H*0.4,200,60,0.1); // table
+  addRectCover(W*0.65,H*0.55,260,80,-0.2); // car
+  addRectCover(W*0.2,H*0.75,120,40,0); // small table
+  addRectCover(W*0.8,H*0.25,360,30,0); // low wall
+  addRectCover(W*0.5,H*0.1,80,160,0.1); // standing wall
+  addRectCover(W*0.9,H*0.8,120,120,0.3); // crate
+}
+
+// Basic utilities
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);} 
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+
+// Line segment intersects polygon edges?
+function segmentIntersectsPolygon(a,b,poly){
+  for(let i=0;i<poly.length;i++){
+    const p1=poly[i], p2=poly[(i+1)%poly.length];
+    if(segmentsIntersect(a,b,p1,p2)) return true;
+  }
+  return false;
+}
+
+function segmentsIntersect(a,b,c,d){
+  // standard segment intersection
+  const orient = (p,q,r)=> (q.x-p.x)*(r.y-p.y) - (q.y-p.y)*(r.x-p.x);
+  const onSeg = (p,q,r)=> Math.min(p.x,r.x) <= q.x + 1e-6 && q.x <= Math.max(p.x,r.x) + 1e-6 && Math.min(p.y,r.y) <= q.y + 1e-6 && q.y <= Math.max(p.y,r.y) + 1e-6;
+  const o1=orient(a,b,c), o2=orient(a,b,d), o3=orient(c,d,a), o4=orient(c,d,b);
+  if(o1*o2 < 0 && o3*o4 < 0) return true;
+  if(Math.abs(o1) < 1e-6 && onSeg(a,c,b)) return true;
+  if(Math.abs(o2) < 1e-6 && onSeg(a,d,b)) return true;
+  if(Math.abs(o3) < 1e-6 && onSeg(c,a,d)) return true;
+  if(Math.abs(o4) < 1e-6 && onSeg(c,b,d)) return true;
+  return false;
+}
+
+// Check if line segment a-b is blocked by any cover
+function isLineBlocked(a,b){
+  for(const poly of covers){
+    if(segmentIntersectsPolygon(a,b,poly)) return true;
+  }
+  return false;
+}
+
+// Get closest point from point p to polygon edges (returns {x,y,edgeIndex})
+function closestPointOnPolygon(p,poly){
+  let best=null, bestd=1e9;
+  for(let i=0;i<poly.length;i++){
+    const a=poly[i], b=poly[(i+1)%poly.length];
+    const cp = closestPointOnSegment(p,a,b);
+    const d = dist(p,cp);
+    if(d<bestd){bestd=d; best=Object.assign({},cp); best.edge=i;}
+  }
+  return best;
+}
+function closestPointOnSegment(p,a,b){
+  const vx=b.x-a.x, vy=b.y-a.y;
+  const t = ((p.x-a.x)*vx + (p.y-a.y)*vy) / (vx*vx+vy*vy || 1e-6);
+  const u = clamp(t,0,1);
+  return {x:a.x+vx*u, y:a.y+vy*u};
+}
+
+// Entities
+const player = {
+  x: W*0.5, y:H*0.85, vx:0, vy:0, health: config.playerHealth, crouch:false
+};
+
+const enemies = [];
+const bullets = []; // {x,y,vx,vy,owner}
+
+function spawnEnemy(x,y){
+  enemies.push({x,y,hp:config.enemyHealth, state:'seek', target:null, fireCooldown: Math.random()*config.enemyFireInterval});
+}
+
+function spawnInitialEnemies(){
+  enemies.length = 0;
+  for(let i=0;i<config.enemySpawn;i++){
+    const x = Math.random()*(W*0.9)+W*0.05;
+    const y = Math.random()*(H*0.5)+H*0.02;
+    spawnEnemy(x,y);
+  }
+}
+
+// Mouse state
+const mouse = {x:W/2,y:H/2,pressed:false};
+canvas.addEventListener('mousemove',e=>{const r=canvas.getBoundingClientRect();mouse.x=e.clientX-r.left;mouse.y=e.clientY-r.top;});
+canvas.addEventListener('mousedown',e=>{if(e.button===0) mouse.pressed=true;});
+canvas.addEventListener('mouseup',e=>{if(e.button===0) mouse.pressed=false;});
+
+// Input
+const keys = {};
+window.addEventListener('keydown',e=>{keys[e.key.toLowerCase()] = true; if(e.key==='c' || e.key==='C'){player.crouch = true;} });
+window.addEventListener('keyup',e=>{keys[e.key.toLowerCase()] = false; if(e.key==='c' || e.key==='C'){player.crouch = false;} });
+
+// Shooting
+let playerFireCooldown = 0;
+function fireBullet(x,y,tx,ty,owner){
+  const ang = Math.atan2(ty-y, tx-x);
+  bullets.push({x,y,vx:Math.cos(ang)*config.bulletSpeed, vy:Math.sin(ang)*config.bulletSpeed, owner, life:1.2});
+}
+
+// Update loop
+let last = performance.now();
+function update(now){
+  const dt = Math.min(0.05, (now-last)/1000);
+  last = now;
+
+  // Player movement
+  const speed = player.crouch ? config.crouchSpeed : config.playerSpeed;
+  let dx=0, dy=0;
+  if(keys['w']||keys['arrowup']) dy -= 1;
+  if(keys['s']||keys['arrowdown']) dy += 1;
+  if(keys['a']||keys['arrowleft']) dx -= 1;
+  if(keys['d']||keys['arrowright']) dx += 1;
+  const len = Math.hypot(dx,dy) || 1;
+  player.vx = dx/len*speed;
+  player.vy = dy/len*speed;
+  player.x += player.vx*dt;
+  player.y += player.vy*dt;
+  player.x = clamp(player.x, 20, W-20);
+  player.y = clamp(player.y, 20, H-20);
+
+  // Player shooting
+  playerFireCooldown -= dt;
+  if(mouse.pressed && playerFireCooldown <= 0){
+    const fov = player.crouch?config.crouchFov:config.fovRadius;
+    // allow shoot always but faster when not crouched
+    fireBullet(player.x, player.y, mouse.x, mouse.y, 'player');
+    playerFireCooldown = player.crouch ? 0.28 : 0.18;
+  }
+
+  // Bullets
+  for(let i=bullets.length-1;i>=0;i--){
+    const b = bullets[i];
+    b.x += b.vx*dt; b.y += b.vy*dt; b.life -= dt;
+    let removed=false;
+    // Remove if out of bounds
+    if(b.x < -50 || b.x>W+50 || b.y<-50 || b.y>H+50) removed=true;
+    // Check collisions with covers (block bullets)
+    for(const poly of covers){
+      // check if segment from prev to curr intersects poly
+      const prev = {x: b.x - b.vx*dt, y: b.y - b.vy*dt};
+      if(segmentIntersectsPolygon(prev, {x:b.x,y:b.y}, poly)) { removed = true; break; }
+    }
+    if(removed || b.life<=0){ bullets.splice(i,1); continue; }
+    // Check hit on enemies or player
+    if(b.owner === 'player'){
+      for(let j=enemies.length-1;j>=0;j--){
+        const e = enemies[j];
+        if(dist(b,{x:e.x,y:e.y}) < 16){ e.hp -= 1; bullets.splice(i,1); removed=true; if(e.hp<=0) enemies.splice(j,1); break; }
+      }
+    } else {
+      // enemy bullet can hit player
+      if(dist(b, player) < (config.playerRadius - (player.crouch?4:0))){ player.health -= 1; bullets.splice(i,1); removed=true; }
+    }
+  }
+
+  // Enemy AI
+  for(const e of enemies){
+    // Check line of sight to player
+    const hasLOS = !isLineBlocked({x:e.x,y:e.y},{x:player.x,y:player.y});
+    if(hasLOS){
+      // aim and shoot periodically
+      e.fireCooldown -= dt;
+      if(e.fireCooldown <= 0){
+        // shoot towards player but from slightly offset (simulate cover peek)
+        const aimNoise = (Math.random()-0.5)*0.2;
+        const tx = player.x + aimNoise*50;
+        const ty = player.y + aimNoise*50;
+        fireBullet(e.x, e.y, tx, ty, 'enemy');
+        e.fireCooldown = config.enemyFireInterval*(0.8+Math.random()*0.6);
+      }
+      // When has LOS, sometimes strafe or take cover
+      // Move slower when shooting
+      const dirx = player.x - e.x, diry = player.y - e.y;
+      const d = Math.hypot(dirx,diry) || 1;
+      // If very close, try to back off to find cover
+      if(d < 120){
+        // move perpendicular to try to use cover
+        e.x -= (diry/d) * config.enemySpeed * dt * (1+Math.random()*0.8);
+        e.y += (dirx/d) * config.enemySpeed * dt * (1+Math.random()*0.8);
+      } else {
+        // small jitter motion
+        e.x += (dirx/d) * (config.enemySpeed*0.6) * dt;
+        e.y += (diry/d) * (config.enemySpeed*0.6) * dt;
+      }
+    } else {
+      // No LOS: move towards nearest cover edge that provides cover from player
+      if(!e.target || Math.random() < 0.005){
+        // sample edges to find candidate points
+        let best=null, bestScore=1e9;
+        for(const poly of covers){
+          const cp = closestPointOnPolygon({x:e.x,y:e.y}, poly);
+          // score: distance from player when using this point, prefer points that block LOS
+          if(!cp) continue;
+          const blocked = isLineBlocked({x:cp.x,y:cp.y}, {x:player.x,y:player.y});
+          if(!blocked) continue; // not useful as cover
+          const score = dist(cp, {x:player.x,y:player.y}) + dist(cp,{x:e.x,y:e.y})*0.6;
+          if(score < bestScore){ bestScore=score; best = cp; }
+        }
+        if(best) e.target = best; else { e.target = {x:Math.random()*W,y:Math.random()*H*0.5}; }
+      }
+      // Move toward target
+      if(e.target){
+        const dx = e.target.x - e.x, dy = e.target.y - e.y;
+        const d = Math.hypot(dx,dy) || 1;
+        e.x += (dx/d) * config.enemySpeed * dt;
+        e.y += (dy/d) * config.enemySpeed * dt;
+        if(d < 6) e.target = null;
+      }
+    }
+    // clamp enemy inside bounds
+    e.x = clamp(e.x, 8, W-8);
+    e.y = clamp(e.y, 8, H-8);
+  }
+
+}
+
+// Rendering
+function draw(){
+  ctx.clearRect(0,0,W,H);
+
+  // background grid for orientation
+  ctx.fillStyle = '#6b8a9a';
+  ctx.fillRect(0,0,W,H);
+
+  // Draw covers
+  ctx.fillStyle = '#3a3a3a';
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 2;
+  for(const poly of covers){
+    ctx.beginPath();
+    ctx.moveTo(poly[0].x, poly[0].y);
+    for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x, poly[i].y);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+  }
+
+  // Draw enemies
+  for(const e of enemies){
+    // body
+    ctx.save();
+    ctx.translate(e.x,e.y);
+    ctx.fillStyle = '#b53737';
+    ctx.beginPath(); ctx.arc(0,0,12,0,Math.PI*2); ctx.fill();
+    // health bar
+    ctx.fillStyle = '#000'; ctx.fillRect(-14,-22,28,6);
+    ctx.fillStyle = '#0f0'; ctx.fillRect(-13,-21,26*(e.hp/config.enemyHealth),4);
+    ctx.restore();
+  }
+
+  // Draw bullets
+  for(const b of bullets){
+    ctx.beginPath(); ctx.fillStyle = b.owner==='player'? '#fffb60' : '#ff6b6b'; ctx.arc(b.x,b.y,3,0,Math.PI*2); ctx.fill();
+  }
+
+  // Draw player FOV (circle) - visibility indicator
+  const fov = player.crouch?config.crouchFov:config.fovRadius;
+  ctx.beginPath(); ctx.fillStyle = 'rgba(0,0,0,0.38)';
+  ctx.rect(0,0,W,H); ctx.fill();
+  // clear circle around player to simulate viewcone
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.beginPath(); ctx.fillStyle='rgba(0,0,0,1)'; ctx.arc(player.x, player.y, fov, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  // Draw player
+  ctx.beginPath(); ctx.fillStyle = '#2ec4b6'; ctx.arc(player.x, player.y, config.playerRadius,0,Math.PI*2); ctx.fill();
+  // crouch indicator (player smaller)
+  if(player.crouch){ ctx.beginPath(); ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.arc(player.x, player.y, config.playerRadius-3,0,Math.PI*2); ctx.fill(); }
+
+  // Draw crosshair at mouse
+  ctx.save();
+  ctx.translate(mouse.x, mouse.y);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-12,0); ctx.lineTo(12,0); ctx.moveTo(0,-12); ctx.lineTo(0,12); ctx.stroke();
+  ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.2)'; ctx.arc(0,0,18,0,Math.PI*2); ctx.stroke();
+  ctx.restore();
+
+  // Draw HUD
+  const hud = document.getElementById('hud');
+  hud.innerHTML = `HP: ${player.health} · Gegner: ${enemies.length} · Ducken: ${player.crouch? 'AN' : 'AUS'}`;
+
+  // If player dead
+  if(player.health <= 0){
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff'; ctx.font='48px Arial'; ctx.textAlign='center'; ctx.fillText('Du bist gestorben - Seite neu laden zum Neustart', W/2, H/2);
+  }
+}
+
+// Game loop
+function loop(now){
+  update(now);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// Simple respawn if all enemies dead
+function checkRespawn(){
+  if(enemies.length === 0){
+    setTimeout(()=>{ spawnInitialEnemies(); }, 800);
+  }
+}
+
+// init
+initCovers(); spawnInitialEnemies();
+requestAnimationFrame(loop);
+setInterval(checkRespawn, 1000);
+
+</script>
+</body>
+</html>
